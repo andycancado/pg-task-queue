@@ -1,12 +1,12 @@
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::{postgres::PgListener, Pool, Postgres};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -15,16 +15,22 @@ pub struct TaskNotification {
     pub id: Uuid,
     pub name: String,
     pub status: String,
+    pub payload: Option<Value>,
     pub created_at: DateTime<Utc>,
 }
 
-type TaskHandler = Box<dyn Fn(TaskNotification) + Send + Sync>;
+#[async_trait]
+pub trait TaskHandler: Send + Sync {
+    async fn handle(&self, task: TaskNotification) -> Result<(), sqlx::Error>;
+}
+
+type DynTaskHandler = Arc<dyn TaskHandler>;
 
 #[derive(Clone)]
 pub struct TaskProcessor {
     pool: Pool<Postgres>,
     worker_count: usize,
-    handlers: Arc<Mutex<HashMap<String, TaskHandler>>>,
+    handlers: Arc<Mutex<HashMap<String, DynTaskHandler>>>,
 }
 
 #[derive(sqlx::Type, Debug, Clone, Copy)]
@@ -57,12 +63,12 @@ impl TaskProcessor {
         }
     }
 
-    pub async fn register_handler<F>(&self, event: &str, handler: F)
+    pub async fn register_handler<H>(&self, event: &str, handler: H)
     where
-        F: Fn(TaskNotification) + Send + Sync + 'static,
+        H: TaskHandler + 'static,
     {
         let mut handlers = self.handlers.lock().await;
-        handlers.insert(event.to_string(), Box::new(handler));
+        handlers.insert(event.to_string(), Arc::new(handler));
         tracing::info!("Handler Registered: {:?}", handlers.keys());
     }
 
@@ -74,9 +80,39 @@ impl TaskProcessor {
             tracing::info!("Processing task {}", notification.id);
             self.update_task_status(&notification.id, TaskStatus::Processing)
                 .await?;
-            handler(notification.clone());
-            self.update_task_status(&notification.id, TaskStatus::Completed)
-                .await?;
+
+            let handler = handler.clone();
+            let notification_clone = notification.clone();
+            let pool = self.pool.clone();
+
+            tokio::spawn(async move {
+                match handler.handle(notification_clone).await {
+                    Ok(_) => {
+                        if let Err(e) = Self::update_task_status_static(
+                            &pool,
+                            &notification.id,
+                            TaskStatus::Completed,
+                        )
+                        .await
+                        {
+                            tracing::error!("Failed to update task status: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Task handler error: {}", e);
+                        if let Err(e) = Self::update_task_status_static(
+                            &pool,
+                            &notification.id,
+                            TaskStatus::Failed,
+                        )
+                        .await
+                        {
+                            tracing::error!("Failed to update task status: {}", e);
+                        }
+                    }
+                }
+            });
+
             Ok(())
         } else {
             tracing::warn!("No handler registered for task: {}", notification.id);
@@ -88,6 +124,14 @@ impl TaskProcessor {
 
     async fn update_task_status(
         &self,
+        task_id: &Uuid,
+        status: TaskStatus,
+    ) -> Result<(), sqlx::Error> {
+        Self::update_task_status_static(&self.pool, task_id, status).await
+    }
+
+    async fn update_task_status_static(
+        pool: &Pool<Postgres>,
         task_id: &Uuid,
         status: TaskStatus,
     ) -> Result<(), sqlx::Error> {
@@ -108,7 +152,7 @@ impl TaskProcessor {
             status as TaskStatus,
             task_id
         )
-        .execute(&self.pool)
+        .execute(pool)
         .await?;
 
         if result.rows_affected() == 0 {
@@ -120,7 +164,7 @@ impl TaskProcessor {
         Ok(())
     }
 
-    pub async fn start_exp(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut listener = PgListener::connect_with(&self.pool).await?;
         listener.listen("task_changes").await?;
 
@@ -129,47 +173,49 @@ impl TaskProcessor {
         self.process_existing_tasks().await?;
 
         let (tx, rx) = mpsc::channel::<TaskNotification>(100);
+        let rx = Arc::new(Mutex::new(rx));
 
-        // Spawn listener task
-        tokio::spawn({
-            let tx = tx.clone();
-            async move {
-                while let Ok(notification) = listener.recv().await {
-                    match serde_json::from_str::<TaskNotification>(notification.payload()) {
-                        Ok(task_notif) if task_notif.status == "pending" => {
-                            if let Err(e) = tx.send(task_notif).await {
-                                tracing::error!("Failed to send task to channel: {}", e);
-                            }
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            while let Ok(notification) = listener.recv().await {
+                match serde_json::from_str::<TaskNotification>(notification.payload()) {
+                    Ok(task_notif) if task_notif.status == "pending" => {
+                        if let Err(e) = tx_clone.send(task_notif).await {
+                            tracing::error!("Failed to send task to channel: {}", e);
                         }
-                        Ok(_) => tracing::debug!("Ignoring non-pending task"),
-                        Err(e) => tracing::error!("Failed to parse notification: {}", e),
                     }
+                    Ok(_) => tracing::debug!("Ignoring non-pending task"),
+                    Err(e) => tracing::error!("Failed to parse notification: {}", e),
                 }
             }
         });
 
-        let rx = Arc::new(Mutex::new(rx));
-
         // Spawn worker tasks
         let worker_handles: Vec<_> = (0..self.worker_count)
             .map(|id| {
-                let rx = rx.clone();
                 let processor = self.clone();
+                let rx = rx.clone();
 
                 tokio::spawn(async move {
                     tracing::info!("Worker {} started", id);
-
                     loop {
                         let notification = {
-                            let mut rx = rx.lock().await;
-                            rx.recv().await
+                            let mut rx_lock = rx.lock().await;
+                            rx_lock.recv().await
                         };
 
                         match notification {
                             Some(task) => {
-                                if let Err(e) = processor.process_task(task).await {
-                                    tracing::error!("Worker {} error processing task: {}", id, e);
-                                }
+                                let processor_clone = processor.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = processor_clone.process_task(task).await {
+                                        tracing::error!(
+                                            "Worker {} error processing task: {}",
+                                            id,
+                                            e
+                                        );
+                                    }
+                                });
                             }
                             None => {
                                 tracing::info!("Worker {} channel closed, shutting down", id);
@@ -188,83 +234,12 @@ impl TaskProcessor {
         Ok(())
     }
 
-    pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut listener = PgListener::connect_with(&self.pool).await?;
-        listener.listen("task_changes").await?;
-
-        tracing::info!("Starting task processor with {} workers", self.worker_count);
-
-        self.process_existing_tasks().await?;
-
-        let (tx, mut rx) = mpsc::channel::<TaskNotification>(100);
-
-        tokio::spawn(async move {
-            while let Ok(notification) = listener.recv().await {
-                match serde_json::from_str::<TaskNotification>(notification.payload()) {
-                    Ok(task_notif) if task_notif.status == "pending" => {
-                        if let Err(e) = tx.send(task_notif).await {
-                            tracing::error!("Failed to send task to channel: {}", e);
-                        }
-                    }
-                    Ok(_) => tracing::debug!("Ignoring non-pending task"),
-                    Err(e) => tracing::error!("Failed to parse notification: {}", e),
-                }
-            }
-        });
-
-        let pool = self.pool.clone();
-
-        let mut worker_txs = Vec::new();
-        let worker_handles: Vec<_> = (0..self.worker_count)
-            .map(|id| {
-                // for id in 0..worker_count {
-                let (worker_tx, mut worker_rx) = mpsc::channel::<TaskNotification>(100);
-                worker_txs.push(worker_tx);
-                // let pool = pool.clone();
-                let processor = self.clone();
-
-                tokio::spawn(async move {
-                    tracing::info!("Worker {} started", id);
-
-                    while let Some(notification) = worker_rx.recv().await {
-
-                        if let Err(e) = processor.process_task(notification).await {
-                            tracing::error!("Worker {} error processing task: {}", id, e);
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        // Dispatcher task
-        let dispatcher = Arc::new(tokio::sync::Mutex::new(worker_txs));
-        let dispatcher_clone = dispatcher.clone();
-        tokio::spawn(async move {
-            let mut round = 0;
-            while let Some(notification) = rx.recv().await {
-                let workers = dispatcher_clone.lock().await;
-                if round >= workers.len() {
-                    round = 0;
-                }
-                if let Err(e) = workers[round].send(notification).await {
-                    tracing::error!("Failed to send to worker {}: {}", round, e);
-                }
-                round += 1;
-            }
-        });
-
-        for handle in worker_handles {
-            handle.await?;
-        }
-        Ok(())
-    }
-
     async fn process_existing_tasks(&self) -> Result<(), sqlx::Error> {
         tracing::info!("Checking for existing pending tasks...");
 
         let pending_tasks = sqlx::query!(
             r#"
-            SELECT id, name, created_at, status::text as "status!"
+            SELECT id, name, payload, created_at, status::text as "status!"
             FROM tasks 
             WHERE status = 'pending'::task_status
             "#
@@ -272,17 +247,22 @@ impl TaskProcessor {
         .fetch_all(&self.pool)
         .await?;
 
-        for task in pending_tasks {
+        let futures = pending_tasks.into_iter().map(|task| {
             let notification = TaskNotification {
                 operation: "INSERT".to_string(),
                 id: task.id,
                 name: task.name,
                 status: task.status,
+                payload: task.payload,
                 created_at: task.created_at.unwrap_or_default(),
             };
+            self.process_task(notification)
+        });
 
-            self.process_task(notification).await?;
-        }
+        futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(())
     }
