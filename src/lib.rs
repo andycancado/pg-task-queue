@@ -86,30 +86,18 @@ impl TaskProcessor {
             let pool = self.pool.clone();
 
             tokio::spawn(async move {
-                match handler.handle(notification_clone).await {
-                    Ok(_) => {
-                        if let Err(e) = Self::update_task_status_static(
-                            &pool,
-                            &notification.id,
-                            TaskStatus::Completed,
-                        )
-                        .await
-                        {
-                            tracing::error!("Failed to update task status: {}", e);
-                        }
-                    }
+                let task_status = match handler.handle(notification_clone).await {
+                    Ok(_) => TaskStatus::Completed,
                     Err(e) => {
                         tracing::error!("Task handler error: {}", e);
-                        if let Err(e) = Self::update_task_status_static(
-                            &pool,
-                            &notification.id,
-                            TaskStatus::Failed,
-                        )
-                        .await
-                        {
-                            tracing::error!("Failed to update task status: {}", e);
-                        }
+                        TaskStatus::Failed
                     }
+                };
+
+                if let Err(e) =
+                    Self::update_task_status_static(&pool, &notification.id, task_status).await
+                {
+                    tracing::error!("Failed to update task status: {}", e);
                 }
             });
 
